@@ -77,6 +77,6 @@ for link_name, spheres in result.link_spheres.items():
 ## Acknowledgments
 
 This project builds on ideas from:
-- [foam](https://github.com/CoMMALab/foam) - Sphere decomposition for robot collision
-- [MorphIt](https://github.com/HIRO-group/MorphIt-1) - Morphological manipulation
+- [foam](https://github.com/CoMMALab/foam)
+- [MorphIt](https://github.com/HIRO-group/MorphIt-1)
 
