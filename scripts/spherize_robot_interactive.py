@@ -23,7 +23,16 @@ import yourdfpy
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
-from ballpark import Robot, RobotSpheresResult, Sphere, SPHERE_COLORS
+from ballpark import (
+    Robot,
+    RobotSpheresResult,
+    Sphere,
+    SPHERE_COLORS,
+    BallparkConfig,
+    SpherizeParams,
+    RefineParams,
+    SpherePreset,
+)
 
 
 def main(
@@ -84,16 +93,17 @@ def main(
 
             # Generate spheres for each link
             target_spheres = gui.total_spheres
+            config = gui.get_config()
             if target_spheres > 0:
                 t0 = time.perf_counter()
-                result = robot.spherize(allocation=allocation)
+                result = robot.spherize(allocation=allocation, config=config)
                 elapsed = (time.perf_counter() - t0) * 1000
                 print(f"Generated {result.num_spheres} spheres in {elapsed:.1f}ms")
 
                 # Optionally refine spheres
                 if gui.refine_enabled:
                     t0 = time.perf_counter()
-                    result = robot.refine(result)
+                    result = robot.refine(result, config=config)
                     elapsed = (time.perf_counter() - t0) * 1000
                     print(f"Refined spheres in {elapsed:.1f}ms")
             else:
@@ -130,6 +140,7 @@ class _SpheresGui:
     """GUI controls for sphere visualization."""
 
     def __init__(self, server: viser.ViserServer, robot: Robot):
+        self._server = server
         self._robot = robot
         self._export_callback: Callable[[], None] | None = None
 
@@ -140,8 +151,18 @@ class _SpheresGui:
         self._last_show: bool = True
         self._last_opacity: float = 0.9
         self._last_refine: bool = False
+        self._last_preset: str = "Balanced"
+        self._last_params: dict[str, float] = {}
         self._needs_recompute = True
         self._needs_visual_update = True
+
+        # Current config (updated by presets or custom sliders)
+        self._current_config = BallparkConfig.from_preset(SpherePreset.BALANCED)
+
+        # Params folder handle and sliders (created dynamically for Custom mode)
+        self._params_folder: viser.GuiFolderHandle | None = None
+        self._params_sliders: dict[str, viser.GuiInputHandle] = {}
+        self._config_folder: viser.GuiFolderHandle | None = None
 
         # Build GUI
         tab_group = server.gui.add_tab_group()
@@ -157,6 +178,15 @@ class _SpheresGui:
                 )
                 self._refine = server.gui.add_checkbox(
                     "Refine (optimize)", initial_value=False
+                )
+
+            # Config folder - preset and parameters
+            self._config_folder = server.gui.add_folder("Config")
+            with self._config_folder:
+                self._preset = server.gui.add_dropdown(
+                    "Preset",
+                    options=["Balanced", "Conservative", "Surface", "Custom"],
+                    initial_value="Balanced",
                 )
 
             with server.gui.add_folder("Allocation"):
@@ -211,6 +241,19 @@ class _SpheresGui:
 
     def poll(self) -> None:
         """Check for GUI changes and update internal state."""
+        # Preset change
+        if self._preset.value != self._last_preset:
+            self._last_preset = self._preset.value
+            self._apply_preset(self._preset.value)
+            self._needs_recompute = True
+
+        # Custom params change (only in Custom mode)
+        if self._preset.value == "Custom" and self._params_sliders:
+            current_params = self._get_params_values()
+            if current_params != self._last_params:
+                self._last_params = current_params
+                self._needs_recompute = True
+
         # Mode change
         if self._mode.value != self._last_mode:
             self._last_mode = self._mode.value
@@ -262,6 +305,171 @@ class _SpheresGui:
             if link_name in group:
                 return group
         return None
+
+    def _create_params_folder(self) -> None:
+        """Create the Params folder with all sliders for Custom mode."""
+        if self._params_folder is not None:
+            return  # Already exists
+        if self._config_folder is None:
+            return  # Config folder not initialized
+
+        cfg = self._current_config
+
+        with self._config_folder:
+            self._params_folder = self._server.gui.add_folder("Params")
+
+        with self._params_folder:
+            # Spherize parameters
+            with self._server.gui.add_folder("Spherize"):
+                self._params_sliders["padding"] = self._server.gui.add_slider(
+                    "padding", min=1.0, max=1.2, step=0.01,
+                    initial_value=cfg.spherize.padding,
+                )
+                self._params_sliders["target_tightness"] = self._server.gui.add_slider(
+                    "target_tightness", min=1.0, max=2.0, step=0.05,
+                    initial_value=cfg.spherize.target_tightness,
+                )
+                self._params_sliders["aspect_threshold"] = self._server.gui.add_slider(
+                    "aspect_threshold", min=1.0, max=2.0, step=0.05,
+                    initial_value=cfg.spherize.aspect_threshold,
+                )
+                self._params_sliders["percentile"] = self._server.gui.add_slider(
+                    "percentile", min=90.0, max=100.0, step=0.5,
+                    initial_value=cfg.spherize.percentile,
+                )
+                self._params_sliders["max_radius_ratio"] = self._server.gui.add_slider(
+                    "max_radius_ratio", min=0.2, max=0.8, step=0.05,
+                    initial_value=cfg.spherize.max_radius_ratio,
+                )
+                self._params_sliders["uniform_radius"] = self._server.gui.add_checkbox(
+                    "uniform_radius", initial_value=cfg.spherize.uniform_radius,
+                )
+
+            # Refine optimization parameters
+            with self._server.gui.add_folder("Optimization"):
+                self._params_sliders["lr"] = self._server.gui.add_slider(
+                    "lr", min=0.0001, max=0.01, step=0.0001,
+                    initial_value=cfg.refine.lr,
+                )
+                self._params_sliders["n_iters"] = self._server.gui.add_slider(
+                    "n_iters", min=10, max=500, step=10,
+                    initial_value=cfg.refine.n_iters,
+                )
+                self._params_sliders["tol"] = self._server.gui.add_slider(
+                    "tol", min=1e-6, max=1e-2, step=1e-5,
+                    initial_value=cfg.refine.tol,
+                )
+
+            # Per-link loss weights
+            with self._server.gui.add_folder("Per-Link Losses"):
+                self._params_sliders["lambda_under"] = self._server.gui.add_slider(
+                    "lambda_under", min=0.0, max=5.0, step=0.1,
+                    initial_value=cfg.refine.lambda_under,
+                )
+                self._params_sliders["lambda_over"] = self._server.gui.add_slider(
+                    "lambda_over", min=0.0, max=0.1, step=0.001,
+                    initial_value=cfg.refine.lambda_over,
+                )
+                self._params_sliders["lambda_overlap"] = self._server.gui.add_slider(
+                    "lambda_overlap", min=0.0, max=0.5, step=0.01,
+                    initial_value=cfg.refine.lambda_overlap,
+                )
+                self._params_sliders["lambda_uniform"] = self._server.gui.add_slider(
+                    "lambda_uniform", min=0.0, max=1.0, step=0.05,
+                    initial_value=cfg.refine.lambda_uniform,
+                )
+                self._params_sliders["lambda_surface"] = self._server.gui.add_slider(
+                    "lambda_surface", min=0.0, max=1.0, step=0.05,
+                    initial_value=cfg.refine.lambda_surface,
+                )
+                self._params_sliders["lambda_sqem"] = self._server.gui.add_slider(
+                    "lambda_sqem", min=0.0, max=1.0, step=0.05,
+                    initial_value=cfg.refine.lambda_sqem,
+                )
+
+            # Robot-level loss weights
+            with self._server.gui.add_folder("Robot-Level Losses"):
+                self._params_sliders["lambda_self_collision"] = self._server.gui.add_slider(
+                    "lambda_self_collision", min=0.0, max=10.0, step=0.1,
+                    initial_value=cfg.refine.lambda_self_collision,
+                )
+                self._params_sliders["lambda_center_reg"] = self._server.gui.add_slider(
+                    "lambda_center_reg", min=0.0, max=10.0, step=0.1,
+                    initial_value=cfg.refine.lambda_center_reg,
+                )
+                self._params_sliders["lambda_similarity"] = self._server.gui.add_slider(
+                    "lambda_similarity", min=0.0, max=10.0, step=0.1,
+                    initial_value=cfg.refine.lambda_similarity,
+                )
+                self._params_sliders["mesh_collision_tolerance"] = self._server.gui.add_slider(
+                    "mesh_collision_tol", min=0.0, max=0.05, step=0.001,
+                    initial_value=cfg.refine.mesh_collision_tolerance,
+                )
+
+        # Cache initial values
+        self._last_params = self._get_params_values()
+
+    def _remove_params_folder(self) -> None:
+        """Remove the Params folder."""
+        if self._params_folder is not None:
+            self._params_folder.remove()
+            self._params_folder = None
+            self._params_sliders.clear()
+            self._last_params.clear()
+
+    def _get_params_values(self) -> dict[str, float]:
+        """Get current parameter values from sliders."""
+        if not self._params_sliders:
+            return {}
+        return {name: s.value for name, s in self._params_sliders.items()}
+
+    def _apply_preset(self, preset_name: str) -> None:
+        """Apply a configuration preset."""
+        if preset_name == "Custom":
+            # Custom mode: show Params folder
+            self._create_params_folder()
+        else:
+            # Preset mode: hide Params folder and load config
+            self._remove_params_folder()
+            preset_map = {
+                "Balanced": SpherePreset.BALANCED,
+                "Conservative": SpherePreset.CONSERVATIVE,
+                "Surface": SpherePreset.SURFACE,
+            }
+            self._current_config = BallparkConfig.from_preset(preset_map[preset_name])
+
+    def get_config(self) -> BallparkConfig:
+        """Get the current configuration (from preset or custom sliders)."""
+        if self._preset.value != "Custom":
+            return self._current_config
+
+        # Build config from slider values
+        p = self._params_sliders
+        return BallparkConfig(
+            spherize=SpherizeParams(
+                padding=float(p["padding"].value),
+                target_tightness=float(p["target_tightness"].value),
+                aspect_threshold=float(p["aspect_threshold"].value),
+                percentile=float(p["percentile"].value),
+                max_radius_ratio=float(p["max_radius_ratio"].value),
+                uniform_radius=bool(p["uniform_radius"].value),
+            ),
+            refine=RefineParams(
+                lr=float(p["lr"].value),
+                n_iters=int(p["n_iters"].value),
+                tol=float(p["tol"].value),
+                lambda_under=float(p["lambda_under"].value),
+                lambda_over=float(p["lambda_over"].value),
+                lambda_overlap=float(p["lambda_overlap"].value),
+                lambda_uniform=float(p["lambda_uniform"].value),
+                lambda_surface=float(p["lambda_surface"].value),
+                lambda_sqem=float(p["lambda_sqem"].value),
+                lambda_self_collision=float(p["lambda_self_collision"].value),
+                lambda_center_reg=float(p["lambda_center_reg"].value),
+                lambda_similarity=float(p["lambda_similarity"].value),
+                mesh_collision_tolerance=float(p["mesh_collision_tolerance"].value),
+            ),
+        )
 
     @property
     def is_auto_mode(self) -> bool:
