@@ -31,48 +31,96 @@ class SimilarityResult:
     transforms: dict[tuple[str, str], np.ndarray] = field(default_factory=dict)
 
 
-def _compute_alignment_transform(mesh_a, mesh_b) -> np.ndarray:
-    """Compute 4x4 transform that aligns mesh_a to mesh_b.
+def _find_mirror_axis(centered_a: np.ndarray, centered_b: np.ndarray) -> int | None:
+    """Check if meshes are mirrors of each other along a single axis.
 
-    Uses centroid alignment + PCA-based rotation alignment.
+    Args:
+        centered_a: Vertices of mesh A centered at origin
+        centered_b: Vertices of mesh B centered at origin
 
     Returns:
-        4x4 homogeneous transform matrix T such that T @ point_in_a ≈ point_in_b
+        Axis index (0=X, 1=Y, 2=Z) if mirrored, None otherwise
+    """
+    # Sort vertices for comparison (order-independent matching)
+    sorted_a = np.sort(centered_a, axis=0)
+
+    for axis in range(3):
+        # Flip this axis in B
+        flipped_b = centered_b.copy()
+        flipped_b[:, axis] *= -1
+        sorted_flipped_b = np.sort(flipped_b, axis=0)
+
+        if np.allclose(sorted_a, sorted_flipped_b, atol=1e-6):
+            return axis
+
+    return None
+
+
+def _compute_alignment_transform(mesh_a, mesh_b) -> tuple[np.ndarray, str]:
+    """Compute 4x4 transform that aligns mesh_a to mesh_b.
+
+    Handles three cases:
+    1. Identical meshes: translation only
+    2. Mirrored meshes: reflection + translation
+    3. Rotated meshes: PCA-based rotation + translation
+
+    Returns:
+        Tuple of (transform, similarity_type) where:
+        - transform: 4x4 homogeneous transform matrix T such that T @ point_in_a ≈ point_in_b
+        - similarity_type: One of "identical", "mirror_X", "mirror_Y", "mirror_Z", or "rotational"
     """
     if mesh_a.is_empty or mesh_b.is_empty:
-        return np.eye(4)
+        return np.eye(4), "unknown"
 
-    # Centroid translation
     centroid_a = mesh_a.centroid
     centroid_b = mesh_b.centroid
 
-    # PCA for rotation alignment
     centered_a = mesh_a.vertices - centroid_a
     centered_b = mesh_b.vertices - centroid_b
 
-    # Compute principal axes via SVD
+    # Only do vertex-by-vertex comparison if meshes have same vertex count
+    same_vertex_count = len(mesh_a.vertices) == len(mesh_b.vertices)
+
+    # Case 1: Check if meshes are identical (just translated)
+    if same_vertex_count:
+        sorted_a = np.sort(centered_a, axis=0)
+        sorted_b = np.sort(centered_b, axis=0)
+        if np.allclose(sorted_a, sorted_b, atol=1e-6):
+            T = np.eye(4)
+            T[:3, 3] = centroid_b - centroid_a
+            return T, "identical"
+
+    # Case 2: Check if meshes are mirrored along a single axis
+    mirror_axis = _find_mirror_axis(centered_a, centered_b) if same_vertex_count else None
+    if mirror_axis is not None:
+        # Build reflection matrix: flip the mirror axis
+        T = np.eye(4)
+        T[mirror_axis, mirror_axis] = -1.0
+        # Translation: account for reflection of centroid_a
+        reflected_centroid_a = centroid_a.copy()
+        reflected_centroid_a[mirror_axis] *= -1.0
+        T[:3, 3] = centroid_b - reflected_centroid_a
+        axis_name = ["X", "Y", "Z"][mirror_axis]
+        return T, f"mirror_{axis_name}"
+
+    # Case 3: Fall back to PCA-based rotation alignment
     _, _, Vt_a = np.linalg.svd(centered_a, full_matrices=False)
     _, _, Vt_b = np.linalg.svd(centered_b, full_matrices=False)
 
     # Rotation from A's frame to B's frame
-    # V_a.T @ point_centered_a = point_in_pca_frame
-    # V_b @ point_in_pca_frame = point_centered_b
-    # So: rotation = V_b @ V_a.T
     rotation_matrix = Vt_b.T @ Vt_a
 
     # Handle reflection (ensure proper rotation, det = 1)
     if np.linalg.det(rotation_matrix) < 0:
-        # Flip the last axis to make it a proper rotation
         Vt_a_fixed = Vt_a.copy()
         Vt_a_fixed[2] = -Vt_a_fixed[2]
         rotation_matrix = Vt_b.T @ Vt_a_fixed
 
-    # Build 4x4 transform: translate to origin, rotate, translate to B
     T = np.eye(4)
     T[:3, :3] = rotation_matrix
     T[:3, 3] = centroid_b - rotation_matrix @ centroid_a
 
-    return T
+    return T, "rotational"
 
 
 def detect_similar_links(
@@ -143,21 +191,11 @@ def detect_similar_links(
             if len(links) >= 2:
                 groups.append(sorted(links))
 
-    # Log detected groups
-    if groups:
-        total_similar = sum(len(g) for g in groups)
-        logger.info(f"Similarity: {len(groups)} group(s), {total_similar} links share geometry")
-        for i, group in enumerate(groups, 1):
-            primary = group[0]
-            secondaries = group[1:]
-            logger.info(f"  Group {i}: {primary} -> {', '.join(secondaries)}")
-    else:
-        logger.info("Similarity: No duplicate geometries found")
-
     # Step 3: Compute transforms between links in each group
     transforms: dict[tuple[str, str], np.ndarray] = {}
+    group_similarity_types: dict[int, list[str]] = {}
 
-    for group in groups:
+    for i, group in enumerate(groups):
         # Get meshes for this group
         meshes = {
             link_name: link_meshes[link_name]
@@ -170,14 +208,45 @@ def detect_similar_links(
             first_link = group[0]
             mesh_first = meshes.get(first_link)
 
+            # Track similarity types for this group
+            similarity_types = []
+
             if mesh_first is not None:
                 for other_link in group[1:]:
                     mesh_other = meshes.get(other_link)
                     if mesh_other is not None:
-                        T = _compute_alignment_transform(mesh_first, mesh_other)
+                        T, sim_type = _compute_alignment_transform(mesh_first, mesh_other)
                         transforms[(first_link, other_link)] = T
                         # Also store inverse for convenience
                         transforms[(other_link, first_link)] = np.linalg.inv(T)
+                        similarity_types.append(sim_type)
+
+            group_similarity_types[i] = similarity_types
+
+    # Log detected groups with similarity types
+    if groups:
+        total_similar = sum(len(g) for g in groups)
+        logger.info(f"Similarity: {len(groups)} group(s), {total_similar} links share geometry")
+        for i, group in enumerate(groups):
+            primary = group[0]
+            secondaries = group[1:]
+
+            # Format similarity type info
+            similarity_types = group_similarity_types.get(i, [])
+            if similarity_types:
+                unique_types = set(similarity_types)
+                if len(unique_types) == 1:
+                    type_str = f" ({similarity_types[0]})"
+                else:
+                    # Multiple types - show per-link
+                    types_list = [f"{secondaries[j]}: {similarity_types[j]}" for j in range(len(similarity_types))]
+                    type_str = f" ({', '.join(types_list)})"
+            else:
+                type_str = ""
+
+            logger.info(f"  Group {i+1}: {primary} -> {', '.join(secondaries)}{type_str}")
+    else:
+        logger.info("Similarity: No duplicate geometries found")
 
     return SimilarityResult(groups=groups, transforms=transforms)
 
