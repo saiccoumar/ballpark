@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, Optional
 
 import numpy as np
 import tyro
@@ -37,17 +37,28 @@ from ballpark import (
 
 def main(
     robot_name: Literal["ur5", "panda", "yumi", "g1", "iiwa14", "gen2"] = "panda",
+    urdf_path: Optional[Path] = None,
 ) -> None:
     """Visualize sphere decomposition on a robot with interactive controls."""
-    print(f"Loading robot: {robot_name}...")
+    if urdf_path is not None:
+        print(f"Loading URDF from path: {urdf_path}...")
+        urdf_path = Path(urdf_path)
+        if not urdf_path.exists() or not urdf_path.is_file():
+            raise SystemExit(f"URDF file not found: {urdf_path}")
 
-    # Load URDF with collision meshes for sphere computation
-    urdf = load_robot_description(f"{robot_name}_description")
-    urdf_coll = yourdfpy.URDF(
-        robot=urdf.robot,
-        filename_handler=urdf._filename_handler,
-        load_collision_meshes=True,
-    )
+        # Load URDF directly from the provided file path
+        urdf = yourdfpy.URDF.load(str(urdf_path), load_collision_meshes=True)
+        urdf_coll = urdf
+    else:
+        print(f"Loading robot: {robot_name}...")
+
+        # Load URDF with collision meshes for sphere computation
+        urdf = load_robot_description(f"{robot_name}_description")
+        urdf_coll = yourdfpy.URDF(
+            robot=urdf.robot,
+            filename_handler=urdf._filename_handler,
+            load_collision_meshes=True,
+        )
 
     # Create Robot instance - analyzes collision geometry and detects similar links
     robot = Robot(urdf_coll)
