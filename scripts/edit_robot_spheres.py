@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, Optional
 
 import numpy as np
 import tyro
@@ -67,6 +67,15 @@ class SphereDataStore:
         self.data[link]["radii"][idx] = new_radius
         self.dirty = True
 
+    def delete_sphere(self, link: str, idx: int) -> None:
+        """Delete a sphere by link name and index."""
+        self.data[link]["centers"].pop(idx)
+        self.data[link]["radii"].pop(idx)
+        # Remove the link entry entirely if no spheres remain
+        if not self.data[link]["radii"]:
+            del self.data[link]
+        self.dirty = True
+
     def save(self) -> None:
         """Write current data back to JSON file."""
         with open(self.path, "w") as f:
@@ -101,6 +110,7 @@ class _EditorGui:
         self._on_save: Callable[[], None] | None = None
         self._on_deselect: Callable[[], None] | None = None
         self._on_radius_change: Callable[[float], None] | None = None
+        self._on_delete: Callable[[], None] | None = None
 
         # Selection info folder (created dynamically)
         self._selection_folder: viser.GuiFolderHandle | None = None
@@ -162,6 +172,9 @@ class _EditorGui:
     def set_on_radius_change(self, callback: Callable[[float], None]) -> None:
         self._on_radius_change = callback
 
+    def set_on_delete(self, callback: Callable[[], None]) -> None:
+        self._on_delete = callback
+
     def update_status(self) -> None:
         """Update status text based on dirty state."""
         self._status_text.value = "Unsaved*" if self._data_store.dirty else "Saved"
@@ -190,6 +203,13 @@ class _EditorGui:
             def _(_) -> None:
                 if self._on_radius_change and self._radius_slider is not None:
                     self._on_radius_change(float(self._radius_slider.value))
+
+            delete_button = self._server.gui.add_button("Delete Sphere", color="red")
+
+            @delete_button.on_click
+            def _(_) -> None:
+                if self._on_delete:
+                    self._on_delete()
 
     def hide_selection_info(self) -> None:
         """Hide the selected sphere info folder."""
@@ -543,6 +563,27 @@ class _EditableSphereVisuals:
         world = R @ local_pos + pos
         return world
 
+    def delete_selected(self) -> None:
+        """Delete the currently selected sphere from data and rebuild visuals."""
+        if self._selected_key is None:
+            return
+
+        parts = self._selected_key.rsplit("_", 1)
+        link_name, idx = parts[0], int(parts[1])
+
+        # Remove transform control
+        if self._transform_control is not None:
+            self._transform_control.remove()
+            self._transform_control = None
+
+        self._selected_key = None
+
+        # Delete from data store
+        self._data_store.delete_sphere(link_name, idx)
+
+        # Rebuild all visuals (indices shift after deletion)
+        self.rebuild(self._normal_opacity, True)
+
     @property
     def has_selection(self) -> bool:
         return self._selected_key is not None
@@ -554,15 +595,17 @@ class _EditableSphereVisuals:
 
 
 def main(
-    robot_name: Literal["ur5", "panda", "yumi", "g1", "iiwa14", "gen2"],
-    json_path: Path,
+    robot_name: Literal["ur5", "panda", "yumi", "g1", "iiwa14", "gen2"] = "panda",
+    json_path: Path = Path("spheres.json"),
+    urdf_path: Optional[Path] = None,
     port: int = 8080,
 ) -> None:
     """Edit robot spheres interactively.
 
     Args:
-        robot_name: Name of the robot (must match the robot used to generate spheres).
+        robot_name: Name of the robot (used when urdf_path is not provided).
         json_path: Path to the JSON file containing sphere data.
+        urdf_path: Path to a local URDF file. Overrides robot_name if provided.
         port: Port for the viser web server.
     """
     # Load sphere data
@@ -573,13 +616,21 @@ def main(
     )
 
     # Load robot
-    print(f"Loading robot: {robot_name}...")
-    urdf = load_robot_description(f"{robot_name}_description")
-    urdf_coll = yourdfpy.URDF(
-        robot=urdf.robot,
-        filename_handler=urdf._filename_handler,
-        load_collision_meshes=True,
-    )
+    if urdf_path is not None:
+        print(f"Loading URDF from path: {urdf_path}...")
+        urdf_path = Path(urdf_path)
+        if not urdf_path.exists() or not urdf_path.is_file():
+            raise SystemExit(f"URDF file not found: {urdf_path}")
+        urdf = yourdfpy.URDF.load(str(urdf_path), load_collision_meshes=True)
+        urdf_coll = urdf
+    else:
+        print(f"Loading robot: {robot_name}...")
+        urdf = load_robot_description(f"{robot_name}_description")
+        urdf_coll = yourdfpy.URDF(
+            robot=urdf.robot,
+            filename_handler=urdf._filename_handler,
+            load_collision_meshes=True,
+        )
     robot = Robot(urdf_coll)
 
     # Check for missing links
@@ -625,9 +676,17 @@ def main(
             sphere_visuals.update_selected_radius(new_radius)
             gui.update_status()
 
+    def on_delete() -> None:
+        if sphere_visuals.has_selection:
+            sphere_visuals.delete_selected()
+            gui.hide_selection_info()
+            gui.update_status()
+            print(f"Deleted sphere. {data_store.num_spheres} spheres remaining.")
+
     gui.set_on_save(on_save)
     gui.set_on_deselect(on_deselect)
     gui.set_on_radius_change(on_radius_change)
+    gui.set_on_delete(on_delete)
     sphere_visuals.set_on_select(on_select)
     sphere_visuals.set_on_position_change(on_position_change)
     sphere_visuals.set_on_deselect(gui.hide_selection_info)
